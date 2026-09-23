@@ -131,46 +131,138 @@ def get_volume(req: VolumeRequest):
 
 
 class ROIAnalyzeRequest(BaseModel):
-    volume: list
+    volume: list = []
     rois: list = []
+
+
+def _roi_error(roi_id, label, center, radius, code, message):
+    return {
+        "id": roi_id,
+        "label": label,
+        "center": center,
+        "radius": radius,
+        "status": "error",
+        "errorCode": code,
+        "message": message,
+        "retryable": code in ("OUT_OF_IMAGE", "PARTIAL_OVERLAP", "RADIUS_INVALID"),
+    }
 
 
 @app.post("/api/roi")
 def analyze_roi(req: ROIAnalyzeRequest):
+    # ---- Validate volume payload ----
+    if not req.volume:
+        return {
+            "status": "error",
+            "errorCode": "NO_VOLUME",
+            "message": "尚未载入影像数据，请先点击“载入影像”后再测量",
+            "rois": [],
+        }
+    try:
+        vol = np.array(req.volume, dtype=np.float32)
+    except Exception:
+        return {
+            "status": "error",
+            "errorCode": "VOLUME_PARSE_ERROR",
+            "message": "影像数据格式异常，无法解析，请重新载入影像",
+            "rois": [],
+        }
+    if vol.ndim != 3 or 0 in vol.shape:
+        return {
+            "status": "error",
+            "errorCode": "VOLUME_INVALID",
+            "message": f"影像体数据异常（维度不合法: {list(vol.shape)}），请重新载入影像",
+            "rois": [],
+        }
+    if vol.size == 0 or not np.isfinite(vol).all():
+        return {
+            "status": "error",
+            "errorCode": "VOLUME_CORRUPT",
+            "message": "影像数据缺失或包含非法值（NaN/Infinity），请重新载入影像",
+            "rois": [],
+        }
+
+    d, h, w = vol.shape
     results = []
+
     for roi in req.rois:
-        center = roi.get("center", [32, 32, 32])
+        roi_id = roi.get("id")
+        center = roi.get("center", [w // 2, h // 2, d // 2])
         radius = roi.get("radius", 8)
-        label = roi.get("label", "roi")
+        label = roi.get("label", "roi") or "roi"
 
-        # Extract voxels within sphere
-        voxels = []
-        try:
-            vol = np.array(req.volume)
-            d, h, w = vol.shape
-            for z in range(max(0, center[2]-radius), min(d, center[2]+radius+1)):
-                for y in range(max(0, center[1]-radius), min(h, center[1]+radius+1)):
-                    for x in range(max(0, center[0]-radius), min(w, center[0]+radius+1)):
-                        if math.sqrt((x-center[0])**2 + (y-center[1])**2 + (z-center[2])**2) <= radius:
-                            voxels.append(float(vol[z, y, x]))
-        except:
-            voxels = []
+        if (not isinstance(center, (list, tuple)) or len(center) != 3
+                or any(not isinstance(c, (int, float)) for c in center)):
+            results.append(_roi_error(roi_id, label, center, radius,
+                                      "CENTER_INVALID", "ROI中心点参数不合法"))
+            continue
 
-        if voxels:
-            arr = np.array(voxels)
-            results.append({
-                "label": label,
-                "center": center,
-                "radius": radius,
-                "mean": round(float(np.mean(arr)), 2),
-                "std": round(float(np.std(arr)), 2),
-                "min": round(float(np.min(arr)), 2),
-                "max": round(float(np.max(arr)), 2),
-                "voxelCount": len(voxels),
-                "histogram": np.histogram(arr, bins=10, range=(float(np.min(arr)), float(np.max(arr))))[0].tolist()
-            })
+        cx, cy, cz = center
+        if not isinstance(radius, (int, float)) or radius <= 0:
+            results.append(_roi_error(roi_id, label, center, radius,
+                                      "RADIUS_INVALID", "ROI半径必须为大于0的数值"))
+            continue
 
-    return {"rois": results}
+        # Bounds check (voxel indices: x in [0,w), y in [0,h), z in [0,d))
+        if (cx + radius < 0 or cx - radius >= w or
+                cy + radius < 0 or cy - radius >= h or
+                cz + radius < 0 or cz - radius >= d):
+            results.append(_roi_error(
+                roi_id, label, center, radius, "OUT_OF_IMAGE",
+                f"区域完全落在影像之外（影像范围 0~{w-1}, 0~{h-1}, 0~{d-1}），请调整中心点后重试"))
+            continue
+
+        x0, x1 = max(0, int(cx - radius)), min(w, int(cx + radius) + 1)
+        y0, y1 = max(0, int(cy - radius)), min(h, int(cy + radius) + 1)
+        z0, z1 = max(0, int(cz - radius)), min(d, int(cz + radius) + 1)
+
+        voxels = vol[z0:z1, y0:y1, x0:x1]
+        zz, yy, xx = np.ogrid[z0:z1, y0:y1, x0:x1]
+        mask = (xx - cx) ** 2 + (yy - cy) ** 2 + (zz - cz) ** 2 <= radius ** 2
+        arr = voxels[mask].astype(np.float64)
+
+        if arr.size == 0:
+            results.append(_roi_error(
+                roi_id, label, center, radius, "NO_VOXEL",
+                "ROI内未覆盖任何体素，请增大半径或调整中心点"))
+            continue
+
+        clipped = (cx - radius < 0 or cx + radius >= w or
+                   cy - radius < 0 or cy + radius >= h or
+                   cz - radius < 0 or cz + radius >= d)
+        if not np.isfinite(arr).all():
+            results.append(_roi_error(
+                roi_id, label, center, radius, "DATA_NONFINITE",
+                "ROI内存在非法体素值（NaN/Infinity），数据源可能已损坏"))
+            continue
+
+        vmin, vmax = float(np.min(arr)), float(np.max(arr))
+        if vmax > vmin:
+            counts, edges = np.histogram(arr, bins=10, range=(vmin, vmax))
+            counts, edges = counts.tolist(), edges.tolist()
+        else:
+            # Degenerate case: every voxel has the same value
+            counts = [int(arr.size)] + [0] * 9
+            half = max(abs(vmin) * 0.05, 0.5)
+            edges = list(np.linspace(vmin - half, vmin + half, 11))
+
+        results.append({
+            "id": roi_id,
+            "label": label,
+            "center": [cx, cy, cz],
+            "radius": radius,
+            "status": "partial" if clipped else "ok",
+            "message": "区域部分超出影像边界，统计结果仅包含影像内体素" if clipped else "ok",
+            "mean": round(float(np.mean(arr)), 2),
+            "std": round(float(np.std(arr)), 2),
+            "min": round(vmin, 2),
+            "max": round(vmax, 2),
+            "voxelCount": int(arr.size),
+            "histogram": counts,
+            "histogramEdges": [round(float(e), 2) for e in edges],
+        })
+
+    return {"status": "ok", "rois": results}
 
 
 @app.get("/api/windows")
