@@ -1,6 +1,6 @@
 import random, math
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -135,40 +135,145 @@ class ROIAnalyzeRequest(BaseModel):
     rois: list = []
 
 
+def _fail(roi: dict, code: str, message: str) -> dict:
+    return {
+        "id": roi.get("id"),
+        "label": str(roi.get("label") or "roi"),
+        "center": roi.get("center"),
+        "radius": roi.get("radius"),
+        "status": "error",
+        "errorCode": code,
+        "errorMessage": message,
+    }
+
+
 @app.post("/api/roi")
 def analyze_roi(req: ROIAnalyzeRequest):
+    # ---- 数据源级校验：数据缺失 / 结构异常时直接返回明确错误 ----
+    if req.volume is None:
+        raise HTTPException(status_code=400, detail="未收到体数据，请先载入影像后再测量")
+    try:
+        vol = np.array(req.volume, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(status_code=400, detail="体数据格式异常，无法解析为三维数组")
+    if vol.size == 0:
+        raise HTTPException(status_code=400, detail="体数据为空，没有可测量的影像内容")
+    if vol.ndim != 3:
+        raise HTTPException(status_code=400, detail=f"体数据维度异常：期望三维数组，实际为 {vol.ndim} 维")
+    d, h, w = vol.shape
+    # 注：体数据中的缺失值(NaN/Inf)在各 ROI 内逐区域处理——部分异常跳过并警告，
+    # 全部异常才判该区域失败，避免个别坏体素让整次测量不可用。
+
     results = []
     for roi in req.rois:
-        center = roi.get("center", [32, 32, 32])
-        radius = roi.get("radius", 8)
-        label = roi.get("label", "roi")
+        if not isinstance(roi, dict):
+            results.append(_fail(roi if isinstance(roi, dict) else {},
+                                 "invalid_roi", "该区域参数格式异常"))
+            continue
 
-        # Extract voxels within sphere
-        voxels = []
+        center = roi.get("center")
+        radius = roi.get("radius")
+
+        # ---- 参数校验 ----
+        if not isinstance(center, list) or len(center) != 3:
+            results.append(_fail(roi, "invalid_center", "球心坐标缺失或格式错误，需要 [x, y, z] 三个值"))
+            continue
         try:
-            vol = np.array(req.volume)
-            d, h, w = vol.shape
-            for z in range(max(0, center[2]-radius), min(d, center[2]+radius+1)):
-                for y in range(max(0, center[1]-radius), min(h, center[1]+radius+1)):
-                    for x in range(max(0, center[0]-radius), min(w, center[0]+radius+1)):
-                        if math.sqrt((x-center[0])**2 + (y-center[1])**2 + (z-center[2])**2) <= radius:
-                            voxels.append(float(vol[z, y, x]))
-        except:
-            voxels = []
+            cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+        except (TypeError, ValueError):
+            results.append(_fail(roi, "invalid_center", "球心坐标不是有效数值"))
+            continue
+        if not (math.isfinite(cx) and math.isfinite(cy) and math.isfinite(cz)):
+            results.append(_fail(roi, "invalid_center", "球心坐标包含空值或非数值"))
+            continue
 
-        if voxels:
-            arr = np.array(voxels)
-            results.append({
-                "label": label,
-                "center": center,
-                "radius": radius,
-                "mean": round(float(np.mean(arr)), 2),
-                "std": round(float(np.std(arr)), 2),
-                "min": round(float(np.min(arr)), 2),
-                "max": round(float(np.max(arr)), 2),
-                "voxelCount": len(voxels),
-                "histogram": np.histogram(arr, bins=10, range=(float(np.min(arr)), float(np.max(arr))))[0].tolist()
-            })
+        try:
+            radius = float(radius)
+        except (TypeError, ValueError):
+            results.append(_fail(roi, "invalid_radius", "半径不是有效数值"))
+            continue
+        if not math.isfinite(radius) or radius <= 0:
+            results.append(_fail(roi, "invalid_radius", "半径必须为大于 0 的数值"))
+            continue
+        if radius > 10000:
+            results.append(_fail(roi, "invalid_radius", f"半径 {radius:g} 过大，请检查是否填错单位"))
+            continue
+
+        r = int(math.ceil(radius))
+
+        # ---- 区域是否完全落在影像之外 ----
+        if (cx + radius < 0 or cy + radius < 0 or cz + radius < 0
+                or cx - radius > w - 1 or cy - radius > h - 1 or cz - radius > d - 1):
+            results.append(_fail(
+                roi, "outside_volume",
+                f"球形区域完全位于影像之外（影像范围 x:0~{w-1}, y:0~{h-1}, z:0~{d-1}），未测到任何体素。"
+                "请调整球心坐标后重试"
+            ))
+            continue
+
+        x0, x1 = max(0, int(cx) - r), min(w, int(cx) + r + 1)
+        y0, y1 = max(0, int(cy) - r), min(h, int(cy) + r + 1)
+        z0, z1 = max(0, int(cz) - r), min(d, int(cz) + r + 1)
+
+        # 完整球（未被边界裁剪时）的理论体素数，用于判断是否被裁剪
+        gx, gy, gz = np.mgrid[-r:r+1, -r:r+1, -r:r+1]
+        full_sphere_count = int(np.count_nonzero(gx**2 + gy**2 + gz**2 <= radius**2))
+
+        zz, yy, xx = np.mgrid[z0:z1, y0:y1, x0:x1]
+        mask = (xx - cx)**2 + (yy - cy)**2 + (zz - cz)**2 <= radius**2
+        voxels = vol[z0:z1, y0:y1, x0:x1][mask]
+        voxel_count = int(voxels.size)
+
+        if voxel_count == 0:
+            results.append(_fail(
+                roi, "empty_region",
+                "区域与影像没有交集，未测到任何体素，请调整球心或半径后重试"
+            ))
+            continue
+
+        finite = voxels[np.isfinite(voxels)]
+        bad_count = voxel_count - int(finite.size)
+        if finite.size == 0:
+            results.append(_fail(
+                roi, "data_anomaly",
+                f"区域内 {voxel_count} 个体素全部为缺失值(NaN)或无穷值(Inf)，无法计算统计量"
+            ))
+            continue
+
+        vmin, vmax = float(finite.min()), float(finite.max())
+        if vmax > vmin:
+            counts, edges = np.histogram(finite, bins=10, range=(vmin, vmax))
+            histogram = counts.tolist()
+            bin_edges = [round(float(e), 2) for e in edges]
+        else:
+            # 所有体素取值相同：单桶直方图，避免 range 相等导致的空桶问题
+            histogram = [int(finite.size)]
+            bin_edges = [round(vmin, 2), round(vmax, 2)]
+
+        clipped = voxel_count < full_sphere_count
+        warning = None
+        if clipped:
+            warning = ("区域部分超出影像边界，统计结果仅基于影像内的 "
+                       f"{voxel_count} 个体素（完整球形约 {full_sphere_count} 个）")
+        if bad_count:
+            anomaly_warning = f"区域内有 {bad_count} 个体素为缺失值/无穷值，统计时已跳过"
+            warning = f"{warning}；{anomaly_warning}" if warning else anomaly_warning
+
+        results.append({
+            "id": roi.get("id"),
+            "label": str(roi.get("label") or "roi"),
+            "center": [cx, cy, cz],
+            "radius": radius,
+            "status": "ok",
+            "warning": warning,
+            "mean": round(float(np.mean(finite)), 2),
+            "std": round(float(np.std(finite)), 2),
+            "min": round(vmin, 2),
+            "max": round(vmax, 2),
+            "voxelCount": int(finite.size),
+            "histogram": histogram,
+            "histogramEdges": bin_edges,
+        })
 
     return {"rois": results}
 

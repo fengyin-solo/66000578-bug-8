@@ -22,7 +22,16 @@
         <ROIPanel />
       </div>
     </div>
-    <div class="loading-state" v-else-if="!store.loading">
+    <div class="loading-state" v-else-if="store.loading">
+      <div class="placeholder">正在载入影像…</div>
+    </div>
+    <div class="loading-state" v-else-if="store.volumeError">
+      <el-alert type="error" show-icon :closable="false" class="load-error"
+        :title="'影像载入失败：' + store.volumeError">
+        <el-button size="small" type="primary" @click="store.loadVolume()">重试载入</el-button>
+      </el-alert>
+    </div>
+    <div class="loading-state" v-else>
       <div class="placeholder">选择预设并点击"载入影像"开始分析</div>
     </div>
   </div>
@@ -47,6 +56,7 @@ body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9}
 .dim-info{font-size:11px;color:#8b949e;font-family:monospace}
 .loading-state{display:flex;align-items:center;justify-content:center;height:50vh}
 .placeholder{color:#484f58;font-size:14px}
+.load-error{max-width:420px}
 .main-grid{display:grid;grid-template-columns:1fr 480px;gap:12px;padding:12px 20px;min-height:85vh}
 .render-area{background:#0d1117;border-radius:8px;border:1px solid #30363d;overflow:hidden}
 .mpr-area{display:flex;flex-direction:column;gap:12px;overflow-y:auto}
